@@ -1,0 +1,55 @@
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+from .enrichment import enrich
+from .ia import upload_release
+from .scanning import scan_directory
+from .state.backup import snapshot_logs
+from .state.log_store import LogStateStore
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Resumable FLAC to Internet Archive automated uploader.")
+    parser.add_argument("--root", default=".", help="Root directory containing FLAC folders/singles")
+    parser.add_argument("--collection", default="opensource_audio", help="Internet Archive collection")
+    parser.add_argument("--mediatype", default="audio", help="Internet Archive mediatype")
+    parser.add_argument("--dry-run", action="store_true", help="Scan and resolve without uploading")
+    parser.add_argument(
+        "--delete-after-upload", action="store_true", help="Delete local files/folders after verified upload"
+    )
+
+    args = parser.parse_args()
+    root_path = Path(args.root).resolve()
+
+    print(f"Scanning target path: {root_path}")
+    releases = scan_directory(root_path)
+
+    if not releases:
+        print("No FLAC releases or folders found.")
+        return
+
+    print(f"Found {len(releases)} item(s) to process.")
+    state = LogStateStore()
+    print(f"Device: {state.device_id}  (log: {state.own_log})")
+
+    try:
+        for rel in releases:
+            enrich(rel)
+            upload_release(rel, args.collection, args.mediatype, args.dry_run, args.delete_after_upload, state)
+    except KeyboardInterrupt:
+        print("\nProcess canceled by user. Local files preserved. Exiting...")
+        sys.exit(0)
+    finally:
+        # Cheap — the logs are tiny plain text — so just do it every run.
+        created = snapshot_logs()
+        if created:
+            print(f"Snapshotted {len(created)} state log(s).")
+
+    print("\nBatch processing completed.")
+
+
+if __name__ == "__main__":
+    main()
