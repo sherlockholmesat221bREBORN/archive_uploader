@@ -19,7 +19,7 @@ FATAL_UPLOAD_ERRORS = (
 
 
 def get_expected_file_keys(rel: Release) -> Set[str]:
-    """Calculates expected remote filenames without running heavy encoding or zipping."""
+    """Calculates full expected remote file manifest (every FLAC, every Opus, and ZIPs)."""
     expected = set()
 
     flac_list = [t.path for t in rel.tracks if t.path and t.path.exists()]
@@ -32,7 +32,12 @@ def get_expected_file_keys(rel: Release) -> Set[str]:
         ])
 
     for flac_p in flac_list:
-        expected.add(determine_file_key(flac_p, rel))
+        flac_key = determine_file_key(flac_p, rel)
+        expected.add(flac_key)
+        
+        # Explicitly require derived Opus audio key for EVERY FLAC
+        opus_key = str(Path(flac_key).with_suffix(".opus"))
+        expected.add(opus_key)
 
     is_single = (
         rel.kind == "single"
@@ -48,14 +53,15 @@ def get_expected_file_keys(rel: Release) -> Set[str]:
         expected.add(f"{slug_name}-flac-complete.zip")
         expected.add(f"{slug_name}-opus-complete.zip")
 
+    if rel.cover_path and rel.cover_path.exists():
+        ext = rel.cover_path.suffix.lower()
+        expected.add(f"cover{ext}")
+
     return expected
 
 
 def check_remote_manifest(item_id: str, expected_keys: Set[str]) -> tuple[bool, Set[str]]:
-    """
-    Checks if an IA item exists and whether its remote manifest contains all expected files.
-    Returns (is_complete, missing_keys).
-    """
+    """Checks live IA item file list against expected manifest."""
     try:
         item = ia.get_item(item_id)
         if not getattr(item, "exists", False):
@@ -69,7 +75,7 @@ def check_remote_manifest(item_id: str, expected_keys: Set[str]) -> tuple[bool, 
 
 
 def check_upc_match(rel: Release, expected_keys: Set[str]) -> Optional[str]:
-    """Searches IA for the UPC, verifies artist/ownership, and checks manifest completeness."""
+    """Searches IA for UPC match and checks ownership/manifest completeness."""
     if not rel.upc:
         return None
 
@@ -83,7 +89,6 @@ def check_upc_match(rel: Release, expected_keys: Set[str]) -> Optional[str]:
             item = ia.get_item(target_id)
             meta = getattr(item, "metadata", {})
 
-            # Verify ownership: check matching UPC field or matching artist name
             remote_upc = meta.get("upc") or meta.get("barcode")
             remote_creator = str(meta.get("creator", "")).lower()
             artist_match = rel.artist.lower() in remote_creator
@@ -93,7 +98,7 @@ def check_upc_match(rel: Release, expected_keys: Set[str]) -> Optional[str]:
                 if is_complete:
                     return target_id
                 else:
-                    print(f"  -> Found UPC match '{target_id}', but upload is missing {len(missing)} file(s). Resuming...")
+                    print(f"  -> Found UPC match '{target_id}', missing {len(missing)} file(s). Resuming...")
     except Exception:
         pass
 
@@ -109,62 +114,86 @@ def upload_release(
     state: Optional[StateStore] = None,
     opus_bitrate: str = "192k",
 ) -> None:
-    """Executes pre-checks against DB and live IA manifests before triggering heavy payload creation."""
+    """Executes pre-checks against SQLite DB and live IA manifests before processing."""
     store = state or Store()
 
-    # Fast path: Local DB check
-    qobuz_id = rel.provider_ids.get("qobuz", "")
-    if (rel.upc and store.is_uploaded(rel.upc)) or (qobuz_id and store.is_uploaded(qobuz_id)):
-        print(f"  -> [SKIPPED] Release '{rel.artist} - {rel.title}' complete in local DB.")
-        if delete_after and not dry_run:
-            delete_local_release(rel)
-        return
-
-    # Derive identifier & compute expected lightweight keys
     base = f"{rel.artist} {rel.title}".strip() or rel.dir_or_file.name
     id_hash = hashlib.md5(base.encode("utf-8")).hexdigest()[:8]
     identifier = resolve_identifier(base, id_hash, store)
     expected_keys = get_expected_file_keys(rel)
+    qobuz_id = rel.provider_ids.get("qobuz", "")
 
-    # Check local store for identifier
-    if store.is_uploaded(identifier):
-        print(f"  -> [SKIPPED] '{identifier}' complete in local DB state.")
+    # 1. Local SQLite Manifest Validation
+    if (
+        (rel.upc and store.is_uploaded(rel.upc, expected_files=expected_keys))
+        or (qobuz_id and store.is_uploaded(qobuz_id, expected_files=expected_keys))
+        or store.is_uploaded(identifier, expected_files=expected_keys)
+    ):
+        print(f"  -> [SKIPPED] '{identifier}' fully complete in local SQLite DB.")
         if delete_after and not dry_run:
             delete_local_release(rel)
         return
 
-    # Check live IA remote manifest for direct identifier
+    # 2. Remote IA Manifest Validation (Direct Identifier)
     is_complete, missing_keys = check_remote_manifest(identifier, expected_keys)
     if is_complete:
         print(f"  -> [SKIPPED] '{identifier}' already fully uploaded on Internet Archive.")
         if hasattr(store, "mark_uploaded"):
-            store.mark_uploaded(identifier, expected_keys)
+            store.mark_uploaded(
+                identifier=identifier,
+                files=expected_keys,
+                upc=rel.upc,
+                qobuz_id=qobuz_id,
+            )
         if delete_after and not dry_run:
             delete_local_release(rel)
         return
     elif len(missing_keys) < len(expected_keys):
-        print(f"  -> [RESUMING] '{identifier}' exists on IA but is incomplete ({len(missing_keys)} files missing).")
+        print(f"  -> [RESUMING] '{identifier}' exists on IA but is missing {len(missing_keys)} file(s) (e.g., Opus audio or ZIPs).")
 
-    # Check live IA remote manifest via UPC search if direct ID didn't hit
+    # 3. Remote IA Manifest Validation (UPC Match)
     if len(missing_keys) == len(expected_keys):
         existing_upc_id = check_upc_match(rel, expected_keys)
         if existing_upc_id:
-            print(f"  -> [SKIPPED] Release matched via UPC to fully uploaded item '{existing_upc_id}'.")
+            print(f"  -> [SKIPPED] Matched via UPC to fully uploaded item '{existing_upc_id}'.")
             if hasattr(store, "mark_uploaded"):
-                store.mark_uploaded(existing_upc_id, expected_keys)
+                store.mark_uploaded(
+                    identifier=existing_upc_id,
+                    files=expected_keys,
+                    upc=rel.upc,
+                    qobuz_id=qobuz_id,
+                )
             if delete_after and not dry_run:
                 delete_local_release(rel)
             return
 
-    # Heavy payload generation (Opus conversion & ZIP archives) ONLY if incomplete/missing
+    # 4. Generate Payload & Run Upload (Filtered to missing files if resuming)
     identifier, metadata, files_dict, temp_cleanup_files = build_ia_payload(
         rel, collection, mediatype, known_identifiers=store, opus_bitrate=opus_bitrate
     )
 
+    # Filter out files that already exist on IA
+    if len(missing_keys) < len(expected_keys):
+        files_dict = {k: v for k, v in files_dict.items() if k in missing_keys}
+
     try:
         if dry_run:
-            print(f"  [DRY RUN] Prepared upload payload for '{identifier}' ({len(files_dict)} files).")
+            print(f"  [DRY RUN] Prepared upload payload for '{identifier}' ({len(files_dict)} files to upload).")
             return
+
+        if store and hasattr(store, "record_upload_state"):
+            store.record_upload_state(
+                identifier=identifier,
+                upc=rel.upc or "",
+                qobuz_id=qobuz_id or "",
+                artist=rel.artist,
+                title=rel.title,
+                status="in_progress",
+                qobuz_raw=rel.qobuz_raw_data,
+                mb_raw=rel.mb_raw_data,
+                wiki_raw=rel.wikipedia_article,
+                ia_payload=metadata,
+            )
 
         responses = ia.upload(
             identifier,
@@ -179,7 +208,13 @@ def upload_release(
         if all(getattr(r, "status_code", 200) < 400 for r in responses):
             print("   ✓ Upload complete.")
             if hasattr(store, "mark_uploaded"):
-                store.mark_uploaded(identifier, files_dict.keys())
+                store.mark_uploaded(
+                    identifier=identifier,
+                    files=expected_keys,
+                    metadata=metadata,
+                    upc=rel.upc,
+                    qobuz_id=qobuz_id,
+                )
             if delete_after:
                 delete_local_release(rel)
 
@@ -187,8 +222,12 @@ def upload_release(
         err_msg = str(e).lower()
         if any(fatal in err_msg for fatal in FATAL_UPLOAD_ERRORS):
             print(f"  ⛔ [FATAL ERROR] Item locked or taken offline by IA: {e}")
+            if store and hasattr(store, "record_upload_state"):
+                store.record_upload_state(identifier, rel.upc, qobuz_id, rel.artist, rel.title, "taken_offline")
         else:
             print(f"  ! Upload failed: {e}")
+            if store and hasattr(store, "record_upload_state"):
+                store.record_upload_state(identifier, rel.upc, qobuz_id, rel.artist, rel.title, "failed")
     finally:
         for tmp in temp_cleanup_files:
             try:
