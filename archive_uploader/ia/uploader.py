@@ -189,11 +189,12 @@ def upload_release(
                 artist=rel.artist,
                 title=rel.title,
                 status="in_progress",
-                qobuz_raw=rel.qobuz_raw_data,
-                mb_raw=rel.mb_raw_data,
-                wiki_raw=rel.wikipedia_article,
+                qobuz_raw=getattr(rel, "qobuz_raw_data", getattr(rel, "qobuz_data", getattr(rel, "qobuz_json", None))),
+                mb_raw=getattr(rel, "mb_raw_data", getattr(rel, "mb_data", getattr(rel, "musicbrainz_json", None))),
+                wiki_raw=getattr(rel, "wikipedia_article", getattr(rel, "wiki_raw_data", getattr(rel, "wiki_data", None))),
                 ia_payload=metadata,
             )
+
 
         responses = ia.upload(
             identifier,

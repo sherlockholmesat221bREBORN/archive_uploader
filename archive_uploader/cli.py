@@ -8,8 +8,7 @@ from .enrichment import enrich
 from .ia import upload_release
 from .scanning import scan_directory
 from .state.backup import snapshot_logs
-from .state.log_store import LogStateStore
-
+from .state.store import SQLiteStateStore
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Resumable FLAC to Internet Archive automated uploader.")
@@ -24,6 +23,9 @@ def main() -> None:
     args = parser.parse_args()
     root_path = Path(args.root).resolve()
 
+    # Force exclusive SQLite persistence engine
+    state = SQLiteStateStore()
+
     print(f"Scanning target path: {root_path}")
     releases = scan_directory(root_path)
 
@@ -32,8 +34,6 @@ def main() -> None:
         return
 
     print(f"Found {len(releases)} item(s) to process.")
-    state = LogStateStore()
-    print(f"Device: {state.device_id}  (log: {state.own_log})")
 
     try:
         for rel in releases:
@@ -43,7 +43,6 @@ def main() -> None:
         print("\nProcess canceled by user. Local files preserved. Exiting...")
         sys.exit(0)
     finally:
-        # Cheap — the logs are tiny plain text — so just do it every run.
         created = snapshot_logs()
         if created:
             print(f"Snapshotted {len(created)} state log(s).")
