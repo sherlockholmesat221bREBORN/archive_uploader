@@ -1,34 +1,57 @@
-from __future__ import annotations
+"""Internet Archive item identifier resolution and legacy collision handling."""
 
-from typing import Set
-
+from typing import Any, Optional
 import internetarchive as ia
 
-from ..textutils import slugify
+from archive_uploader.state.store import Store
+from archive_uploader.textutils import slugify
 
 
-def resolve_identifier(base: str, id_hash: str, known_identifiers: Set[str]) -> str:
+def resolve_identifier(
+    base: str,
+    id_hash: str,
+    known_identifiers: Optional[Any] = None,
+) -> str:
     """
-    Two identifier schemes have existed over time (untruncated slug,
-    then a 50-char-truncated slug). This picks the right one so old
-    items keep resuming under their original id instead of forking
-    into a duplicate upload. Don't "simplify" this to just the new
-    scheme — see DECISIONS.md.
+    Resolves canonical IA item identifier. Checks known_identifiers set/store,
+    local store, and remote IA status before falling back to truncated slug.
     """
     full_slug = slugify(base)
     legacy_identifier = f"flac-{full_slug}-{id_hash}"
     truncated_slug = full_slug[:50].rstrip("-")
     new_identifier = f"flac-{truncated_slug}-{id_hash}"
 
-    if legacy_identifier in known_identifiers:
-        return legacy_identifier
+    # Safe check if known_identifiers is a StateStore instance
+    if known_identifiers and hasattr(known_identifiers, "is_uploaded"):
+        if known_identifiers.is_uploaded(legacy_identifier):
+            return legacy_identifier
 
-    if legacy_identifier != new_identifier:
+    # Safe check if known_identifiers is a set or iterable
+    if known_identifiers and hasattr(known_identifiers, "__contains__"):
         try:
-            if ia.get_item(legacy_identifier).exists:
-                print(f"  -> [LEGACY MATCH] Resuming using original ID: {legacy_identifier}")
+            if legacy_identifier in known_identifiers:
                 return legacy_identifier
-        except Exception:
+        except TypeError:
             pass
+
+    # Fast path: Base title wasn't truncated
+    if legacy_identifier == new_identifier:
+        return new_identifier
+
+    # Local state DB lookup
+    try:
+        store = Store()
+        if store.is_uploaded(legacy_identifier):
+            return legacy_identifier
+    except Exception:
+        pass
+
+    # Live Internet Archive remote lookup
+    try:
+        item = ia.get_item(legacy_identifier)
+        if getattr(item, "exists", False):
+            return legacy_identifier
+    except Exception:
+        pass
 
     return new_identifier

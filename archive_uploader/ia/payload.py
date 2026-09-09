@@ -1,35 +1,25 @@
 """Internet Archive payload and metadata builder."""
 
 import hashlib
+import sys
 import tempfile
 import urllib.parse
 from pathlib import Path
-from typing import Dict, List, Set, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from archive_uploader import __version__
 from archive_uploader.ia.identifiers import resolve_identifier
 from archive_uploader.models import ExternalLink, Release
-from archive_uploader.packaging import (
-    create_clean_zip,
-    derive_opus_file,
-    determine_file_key,
-)
+from archive_uploader.packaging import create_clean_zip, derive_opus_file, determine_file_key
 from archive_uploader.state.backup import ensure_script_backup
 from archive_uploader.textutils import slugify
 
-# System files to strictly exclude from uploads
-SYSTEM_EXCLUDES: Set[str] = {
-    ".ds_store",
-    "thumbs.db",
-    "desktop.ini",
-    "@eadir",
-    ".git",
-    ".gitignore",
-    "__pycache__",
+SYSTEM_EXCLUDES = {
+    ".ds_store", "thumbs.db", "desktop.ini", "@eadir",
+    ".git", ".gitignore", "__pycache__",
 }
 
-# Domain to display service name mapping
-DOMAIN_SERVICE_MAP: Dict[str, str] = {
+DOMAIN_SERVICE_MAP = {
     "open.qobuz.com": "Qobuz",
     "qobuz.com": "Qobuz",
     "musicbrainz.org": "MusicBrainz",
@@ -53,10 +43,6 @@ DOMAIN_SERVICE_MAP: Dict[str, str] = {
 
 
 def render_link_badge(link: ExternalLink) -> str:
-    """
-    Formats an ExternalLink object into an HTML badge with fixed 16x16 icon size.
-    Enforces width="16" height="16" attributes because IA's HTML sanitizer strips inline CSS style attributes.
-    """
     domain = urllib.parse.urlparse(link.url).netloc.lower().replace("www.", "")
     service = link.service or DOMAIN_SERVICE_MAP.get(domain, domain.capitalize())
     logo = link.logo_url or f"https://www.google.com/s2/favicons?domain={domain}&sz=32"
@@ -68,7 +54,6 @@ def render_link_badge(link: ExternalLink) -> str:
 
 
 def is_valid_payload_file(p: Path) -> bool:
-    """Checks if a file is a valid payload asset and not a hidden OS metadata file."""
     if p.name.startswith("."):
         return False
     if p.name.lower() in SYSTEM_EXCLUDES:
@@ -80,29 +65,19 @@ def build_ia_payload(
     rel: Release,
     collection: str,
     mediatype: str,
+    known_identifiers: Optional[Any] = None,
     opus_bitrate: str = "192k",
 ) -> Tuple[str, dict, Dict[str, str], List[Path]]:
-    """
-    Builds Internet Archive item payload:
-      1. Resolves canonical identifier.
-      2. Creates version backup for code recoverability.
-      3. Transcodes deterministic Opus files.
-      4. Builds deterministic FLAC and Opus ZIP archives (for albums).
-      5. Generates clean HTML description with 16x16 icon badges.
-      6. Assembles metadata dictionary and external-identifier URNs.
-      7. Maps local files to IA item destination keys.
-    """
+    """Builds Internet Archive payload metadata and target file map."""
     base = f"{rel.artist} {rel.title}".strip() or rel.dir_or_file.name
     id_hash = hashlib.md5(base.encode("utf-8")).hexdigest()[:8]
-    identifier = resolve_identifier(base, id_hash)
+    identifier = resolve_identifier(base, id_hash, known_identifiers)
 
-    # Ensure self-backup snapshot for source script recoverability
     backup_path, script_hash = ensure_script_backup()
 
     temp_cleanup_files: List[Path] = []
     opus_map: Dict[Path, Path] = {}
 
-    # Gather source FLAC files
     flac_list = [t.path for t in rel.tracks if t.path and t.path.exists()]
     if not flac_list and rel.dir_or_file.is_file():
         flac_list = [rel.dir_or_file]
@@ -112,16 +87,21 @@ def build_ia_payload(
             if is_valid_payload_file(p)
         ])
 
-    print(f"   🎵 Deriving deterministic {opus_bitrate} Opus audio files...")
-    for flac_p in flac_list:
-        try:
-            opus_p = derive_opus_file(flac_p, bitrate=opus_bitrate)
-            opus_map[flac_p] = opus_p
-            temp_cleanup_files.append(opus_p)
-        except Exception as e:
-            print(f"  ! Error deriving Opus for {flac_p.name}: {e}")
+    total_flacs = len(flac_list)
+    if total_flacs > 0:
+        for idx, flac_p in enumerate(flac_list, start=1):
+            pct = int((idx / total_flacs) * 100)
+            sys.stdout.write(f"\r   🎵 Deriving {opus_bitrate} Opus audio... {pct}% ({idx}/{total_flacs})")
+            sys.stdout.flush()
+            try:
+                opus_p = derive_opus_file(flac_p, bitrate=opus_bitrate)
+                opus_map[flac_p] = opus_p
+                temp_cleanup_files.append(opus_p)
+            except Exception as e:
+                sys.stdout.write(f"\n      ! Error deriving Opus for {flac_p.name}: {e}\n")
+        sys.stdout.write("\n")
+        sys.stdout.flush()
 
-    # Determine single vs album status
     is_single = (
         rel.kind == "single"
         or getattr(rel, "is_single", False)
@@ -130,7 +110,6 @@ def build_ia_payload(
         or len(flac_list) <= 1
     )
 
-    # HTML Description Construction
     desc: List[str] = [f"<b>{rel.title}</b> by <b>{rel.artist}</b><br><br>"]
 
     if rel.date:
@@ -149,11 +128,8 @@ def build_ia_payload(
         desc.append(f"<b>Composer:</b> {rel.composer}<br>")
     if rel.copyright:
         desc.append(f"<b>Copyright:</b> {rel.copyright}<br>")
-    if getattr(rel, "source", None) and rel.source != "Local Tags":
-        desc.append(f"<b>Source:</b> {rel.source}<br>")
 
     files_dict: Dict[str, str] = {}
-
     slug_name = slugify(base)
     flac_zip_name = f"{slug_name}-flac-complete.zip"
     opus_zip_name = f"{slug_name}-opus-complete.zip"
@@ -165,9 +141,16 @@ def build_ia_payload(
         flac_zip_path = temp_zip_dir / flac_zip_name
         opus_zip_path = temp_zip_dir / opus_zip_name
 
-        print("   📦 Packaging deterministic FLAC and Opus ZIP structures...")
+        sys.stdout.write("   📦 Packaging FLAC ZIP archive...")
+        sys.stdout.flush()
         create_clean_zip(rel, flac_zip_path, exclude_ext=".opus", opus_map=opus_map)
+        sys.stdout.write(" Done.\n")
+
+        sys.stdout.write("   📦 Packaging Opus ZIP archive...")
+        sys.stdout.flush()
         create_clean_zip(rel, opus_zip_path, exclude_ext=".flac", opus_map=opus_map)
+        sys.stdout.write(" Done.\n")
+        sys.stdout.flush()
 
         temp_cleanup_files.extend([flac_zip_path, opus_zip_path])
 
@@ -182,7 +165,7 @@ def build_ia_payload(
         files_dict[flac_zip_name] = str(flac_zip_path)
         files_dict[opus_zip_name] = str(opus_zip_path)
     else:
-        print("   ℹ️  Single detected: Skipping FLAC/Opus ZIP archive creation.")
+        print("   ℹ️  Single detected: Skipping ZIP archive creation.")
 
     if rel.kind == "album" and rel.tracks and not is_single:
         desc.append("<br><b>Tracklist:</b><br><ol>")
@@ -205,23 +188,19 @@ def build_ia_payload(
         badges = [render_link_badge(link) for link in rel.external_links]
         desc.append("<br><b>External Links:</b><br>" + " | ".join(badges))
 
-    # Include source script backup file for full code recoverability
     if backup_path.exists():
         backup_key = f"uploader_script_v{__version__}_{script_hash[:8]}{backup_path.suffix}"
         files_dict[backup_key] = str(backup_path)
 
-    # Map individual FLAC files
     for flac_p in flac_list:
         key = determine_file_key(flac_p, rel)
         files_dict[key] = str(flac_p)
 
-    # Map individual derived Opus files
     for flac_p, opus_p in opus_map.items():
         if opus_p.exists():
             key = determine_file_key(opus_p, rel)
             files_dict[key] = str(opus_p)
 
-    # Map ancillary files (booklets, PDFs, CUEs, artwork, extra documentation)
     if rel.kind == "album" and rel.dir_or_file.is_dir():
         for extra in rel.dir_or_file.rglob("*"):
             if extra.is_file() and is_valid_payload_file(extra):
@@ -230,14 +209,12 @@ def build_ia_payload(
                     if key not in files_dict:
                         files_dict[key] = str(extra)
 
-    # Map Cover Image
     if rel.cover_path and rel.cover_path.exists():
         ext = rel.cover_path.suffix.lower()
         cover_key = f"cover{ext}"
         if cover_key not in files_dict and rel.cover_path.name not in files_dict:
             files_dict[cover_key] = str(rel.cover_path)
 
-    # Build external identifier URN list
     ext_ids: List[str] = []
     for pid, val in rel.provider_ids.items():
         if val:
@@ -247,12 +224,11 @@ def build_ia_payload(
     if rel.isrc:
         ext_ids.append(f"urn:isrc:{rel.isrc}")
 
-    # Build metadata dictionary for Internet Archive API
     subject_tags = [
         t for t in ["flac", "lossless audio", rel.artist, rel.genre, rel.label] if t
     ]
 
-    metadata: Dict[str, any] = {
+    metadata: Dict[str, Any] = {
         "title": rel.title,
         "creator": rel.artist,
         "mediatype": mediatype,

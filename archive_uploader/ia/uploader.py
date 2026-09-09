@@ -1,123 +1,119 @@
-from __future__ import annotations
+"""Internet Archive execution workflow and retry loop."""
 
-import sys
+import hashlib
 import time
-
+from typing import Optional, Set
 import internetarchive as ia
 
-from ..models import Release
-from ..packaging import delete_local_release
-from ..state.store import StateStore
-from .payload import build_ia_payload
+from archive_uploader.ia.identifiers import resolve_identifier
+from archive_uploader.ia.payload import build_ia_payload
+from archive_uploader.models import Release
+from archive_uploader.packaging import delete_local_release
+from archive_uploader.state.store import StateStore, Store
+
+FATAL_UPLOAD_ERRORS = (
+    "access denied", "taken offline", "403", "forbidden",
+    "unauthorized", "item is locked", "darked",
+)
+
+
+def check_remote_ia(identifier: str, upc: Optional[str] = None) -> bool:
+    """Queries Internet Archive remotely for item identifier or UPC match."""
+    try:
+        item = ia.get_item(identifier)
+        if getattr(item, "exists", False):
+            return True
+    except Exception:
+        pass
+
+    if upc:
+        try:
+            results = list(ia.search_items(f'"{upc}"'))
+            if len(results) > 0:
+                return True
+        except Exception:
+            pass
+
+    return False
 
 
 def upload_release(
     rel: Release,
     collection: str,
     mediatype: str,
-    dry_run: bool,
-    delete_after: bool,
-    state: StateStore,
+    dry_run: bool = False,
+    delete_after: bool = False,
+    state: Optional[StateStore] = None,
+    opus_bitrate: str = "192k",
 ) -> None:
-    known_identifiers = state.all_uploaded()
+    """Executes pre-checks against DB/IA state, builds payload, and uploads release."""
+    store = state or Store()
+
+    # 1. Local DB Pre-check
+    qobuz_id = rel.provider_ids.get("qobuz", "")
+    if (
+        (rel.upc and store.is_uploaded(rel.upc))
+        or (qobuz_id and store.is_uploaded(qobuz_id))
+    ):
+        print(f"  -> [SKIPPED] Release '{rel.artist} - {rel.title}' is completed in local DB.")
+        if delete_after and not dry_run:
+            delete_local_release(rel)
+        return
+
+    # 2. Derive identifier early
+    base = f"{rel.artist} {rel.title}".strip() or rel.dir_or_file.name
+    id_hash = hashlib.md5(base.encode("utf-8")).hexdigest()[:8]
+    identifier = resolve_identifier(base, id_hash, store)
+
+    # 3. Check local DB state
+    if store.is_uploaded(identifier):
+        print(f"  -> [SKIPPED] '{identifier}' complete in local DB state.")
+        if delete_after and not dry_run:
+            delete_local_release(rel)
+        return
+
+    # 4. Check Internet Archive remotely before doing any work
+    if check_remote_ia(identifier, rel.upc):
+        print(f"  -> [SKIPPED] '{identifier}' already exists on Internet Archive.")
+        if hasattr(store, "mark_uploaded"):
+            store.mark_uploaded(identifier, [])
+        if delete_after and not dry_run:
+            delete_local_release(rel)
+        return
+
+    # 5. Build heavy payload ONLY if missing from IA and local DB
     identifier, metadata, files_dict, temp_cleanup_files = build_ia_payload(
-        rel, collection, mediatype, known_identifiers
+        rel, collection, mediatype, known_identifiers=store, opus_bitrate=opus_bitrate
     )
 
     try:
-        if state.is_uploaded(identifier):
-            print(f"  -> [SKIPPED] '{identifier}' complete in local state.")
-            if delete_after and not dry_run:
-                delete_local_release(rel)
-            return
-
-        # The local state store is only ever a cache. This live check
-        # against IA is the actual source of truth for "is it already
-        # there" — it's what makes multiple devices safe without any
-        # coordination between them. Don't remove it to "simplify."
-        item = ia.get_item(identifier)
-        if item.exists:
-            try:
-                remote_file_objects = list(item.get_files())
-                remote_files = {f.name for f in remote_file_objects}
-                local_files = set(files_dict.keys())
-
-                is_multidisc_upload = any("/" in key for key in local_files)
-                if is_multidisc_upload:
-                    orphaned_root_flacs = [
-                        f.name
-                        for f in remote_file_objects
-                        if (f.name.endswith(".flac") or f.name.endswith(".opus"))
-                        and "/" not in f.name
-                    ]
-                    if orphaned_root_flacs:
-                        print(
-                            f"\n  -> [REPAIR MODE] Found {len(orphaned_root_flacs)} "
-                            f"misplaced root-level file(s) from previous upload."
-                        )
-                        print("     Purging root files from IA before uploading structured multi-disc folders...")
-                        if not dry_run:
-                            ia.delete(identifier, files=orphaned_root_flacs)
-                            remote_files -= set(orphaned_root_flacs)
-
-                missing_files = local_files - remote_files
-
-                if not missing_files:
-                    print(f"  -> [SKIPPED] '{identifier}' is completely present on IA.")
-                    state.mark_uploaded(identifier, files_dict.keys())
-                    if delete_after and not dry_run:
-                        delete_local_release(rel)
-                    return
-                else:
-                    print(f"\n  -> [RESUMING / REPAIRING UPLOAD] '{identifier}'")
-                    print(
-                        f"     Found {len(remote_files)} file(s) online. "
-                        f"Uploading {len(missing_files)} missing file(s)..."
-                    )
-                    files_dict = {k: v for k, v in files_dict.items() if k in missing_files}
-            except Exception as e:
-                print(f"  ! Error checking remote file manifest ({e}). Proceeding with standard sync...")
-
-        print(f"\n Uploading to Internet Archive: {identifier}")
-        print(f"   Title:   {metadata['title']}")
-        print(f"   UPC:     {metadata.get('upc', '(none)')}")
-        print(f"   Files:   {len(files_dict)} item(s) to upload")
-
         if dry_run:
-            print("   [DRY RUN] Skipping actual network upload and deletion.")
+            print(f"  [DRY RUN] Prepared upload payload for '{identifier}' ({len(files_dict)} files).")
             return
 
-        max_attempts = 5
-        for attempt in range(1, max_attempts + 1):
-            try:
-                responses = ia.upload(
-                    identifier,
-                    files=files_dict,
-                    metadata=metadata,
-                    verbose=True,
-                    retries=10,
-                    retries_sleep=20,
-                    checksum=True,
-                )
-                if all(getattr(r, "status_code", 200) < 400 for r in responses):
-                    print("   \u2713 Upload complete. Triggering background MP3 derivation...")
-                    item.derive()
-                    state.mark_uploaded(identifier, files_dict.keys())
+        responses = ia.upload(
+            identifier,
+            files=files_dict,
+            metadata=metadata,
+            verbose=True,
+            retries=10,
+            retries_sleep=20,
+            checksum=True,
+        )
 
-                    if delete_after:
-                        delete_local_release(rel)
-                    return
-            except KeyboardInterrupt:
-                print("\n  ! Upload interrupted by user (Ctrl+C). Local files preserved. Exiting...")
-                sys.exit(0)
-            except Exception as e:
-                print(f"  ! Upload attempt {attempt} failed: {e}")
+        if all(getattr(r, "status_code", 200) < 400 for r in responses):
+            print("   ✓ Upload complete.")
+            if hasattr(store, "mark_uploaded"):
+                store.mark_uploaded(identifier, files_dict.keys())
+            if delete_after:
+                delete_local_release(rel)
 
-            sleep_time = attempt * 10
-            print(f"  ! Retrying in {sleep_time} seconds...")
-            time.sleep(sleep_time)
-
-        print(f"  \u2715 Failed to complete upload for '{identifier}'. Local files retained.")
+    except Exception as e:
+        err_msg = str(e).lower()
+        if any(fatal in err_msg for fatal in FATAL_UPLOAD_ERRORS):
+            print(f"  ⛔ [FATAL ERROR] Item locked or taken offline by IA: {e}")
+        else:
+            print(f"  ! Upload failed: {e}")
     finally:
         for tmp in temp_cleanup_files:
             try:
