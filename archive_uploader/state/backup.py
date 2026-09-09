@@ -1,44 +1,48 @@
-"""
-Numbered snapshots of the (tiny, append-only) state logs. Call
-snapshot_logs() periodically — once per run is plenty — and you get a
-new backups/<device>_00042.ndjson every time, with no metadata to
-maintain and no message to write.
+"""Self-backup and script recoverability engine."""
 
-Because the logs are the source of truth and are append-only, a backup
-is also automatically a version: replaying <device>_00041.ndjson gives
-you exactly the upload state as of that snapshot.
-
-Sync the whole `backups/` (or even just `logs/`) directory with
-whatever you already use to move files between devices (Syncthing,
-etc.) for off-device redundancy.
-"""
-from __future__ import annotations
-
+import hashlib
 import shutil
+import sys
 from pathlib import Path
-from typing import List
+from typing import Tuple
 
-from ..config import BACKUPS_DIR, LOGS_DIR
+from archive_uploader import __version__
 
-
-def _next_counter(backups_dir: Path, device: str) -> int:
-    counter_file = backups_dir / f"{device}.counter"
-    n = int(counter_file.read_text().strip()) + 1 if counter_file.exists() else 1
-    counter_file.write_text(str(n))
-    return n
+BACKUP_DIR = Path.home() / ".config" / "archive_uploader" / "backups"
 
 
-def snapshot_logs(logs_dir: Path = LOGS_DIR, backups_dir: Path = BACKUPS_DIR) -> List[Path]:
-    backups_dir.mkdir(parents=True, exist_ok=True)
-    created = []
-    for log_file in sorted(logs_dir.glob("*.ndjson")):
-        device = log_file.stem
-        n = _next_counter(backups_dir, device)
-        dest = backups_dir / f"{device}_{n:05d}.ndjson"
-        shutil.copy2(log_file, dest)
-        created.append(dest)
-    return created
+def ensure_script_backup() -> Tuple[Path, str]:
+    """
+    Hashes the running package/script with SHA-256 and creates a version-locked backup copy.
+    Returns a tuple of (backup_filepath, sha256_hash).
+    """
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
 
+    # Determine running entrypoint or module location
+    main_pkg = Path(__file__).resolve().parent.parent
+    if main_pkg.is_dir():
+        # Package mode: create hash from version and file structure
+        hasher = hashlib.sha256()
+        for p in sorted(main_pkg.rglob("*.py")):
+            hasher.update(p.read_bytes())
+        script_hash = hasher.hexdigest()
+        
+        backup_file = BACKUP_DIR / f"archive_uploader-v{__version__}-{script_hash[:8]}.tar.gz"
+        if not backup_file.exists():
+            shutil.make_archive(
+                str(backup_file).replace(".tar.gz", ""),
+                "gztar",
+                root_dir=main_pkg.parent,
+                base_dir=main_pkg.name,
+            )
+    else:
+        # Monolith / single file mode fallback
+        script_path = Path(sys.argv[0]).resolve()
+        script_bytes = script_path.read_bytes()
+        script_hash = hashlib.sha256(script_bytes).hexdigest()
+        
+        backup_file = BACKUP_DIR / f"archive_uploader-v{__version__}-{script_hash[:8]}.py"
+        if not backup_file.exists():
+            backup_file.write_bytes(script_bytes)
 
-def list_backups(device: str, backups_dir: Path = BACKUPS_DIR) -> List[Path]:
-    return sorted(backups_dir.glob(f"{device}_*.ndjson"))
+    return backup_file, script_hash

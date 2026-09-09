@@ -26,8 +26,7 @@ class ExternalLink:
     """
     One badge in the description: a service's logo + a hyperlink to the
     matched page. Every enrichment provider produces zero or more of
-    these instead of the description-builder hardcoding per-service ifs
-    — that's what makes "add a new provider" not touch payload.py.
+    these instead of the description-builder hardcoding per-service ifs.
     """
     service: str          # e.g. "Qobuz", "MusicBrainz"
     url: str
@@ -46,8 +45,7 @@ class Release:
     cover_url: str = ""
     cover_path: Optional[Path] = None
 
-    # Metadata (filled by local tags, then enrichment, then overrides —
-    # see enrichment/pipeline.py for the merge order)
+    # Metadata
     genre: str = ""
     label: str = ""
     upc: str = ""
