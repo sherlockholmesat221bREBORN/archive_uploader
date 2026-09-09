@@ -29,3 +29,7 @@ class Provider(ABC):
         directly. Return None on no match.
         """
         raise NotImplementedError
+
+
+# Alias for backwards compatibility
+BaseEnricher = Provider

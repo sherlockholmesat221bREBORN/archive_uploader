@@ -10,7 +10,7 @@ from typing import Dict, Set
 from archive_uploader.models import Release
 
 FIXED_ZIP_DATETIME = (1980, 1, 1, 0, 0, 0)
-SYSTEM_EXCLUDES = {".ds_store", "thumbs.db", "desktop.ini", "@eaDir"}
+SYSTEM_EXCLUDES = {".ds_store", "thumbs.db", "desktop.ini", "@eadir"}
 
 
 def is_valid_asset(p: Path) -> bool:
@@ -51,6 +51,22 @@ def derive_opus_file(flac_path: Path, bitrate: str = "192k") -> Path:
                 opus_path.unlink()
             raise e
     return opus_path
+
+
+def determine_file_key(file_path: Path, rel: Release) -> str:
+    """Determines relative IA file key, preserving folder structure for multi-file items."""
+    if rel.kind != "album" or not rel.dir_or_file.is_dir():
+        return file_path.name
+
+    album_dir = rel.dir_or_file
+    try:
+        rel_parts = file_path.relative_to(album_dir).parts
+        if len(rel_parts) > 1:
+            return file_path.relative_to(album_dir).as_posix()
+    except ValueError:
+        pass
+
+    return file_path.name
 
 
 def resolve_zip_arcname(file_path: Path, album_dir: Path) -> str:
@@ -114,3 +130,20 @@ def create_clean_zip(
                 add_file_to_zip(opus_file, opus_file.name)
             if rel.cover_path and rel.cover_path.exists():
                 add_file_to_zip(rel.cover_path, rel.cover_path.name)
+
+
+def delete_local_release(rel: Release) -> None:
+    """Safely removes local release files or directory after a successful upload."""
+    target = rel.dir_or_file
+    if not target or not target.exists():
+        return
+
+    try:
+        if target.is_dir():
+            shutil.rmtree(target)
+        elif target.is_file():
+            target.unlink(missing_ok=True)
+            if rel.cover_path and rel.cover_path.exists():
+                rel.cover_path.unlink(missing_ok=True)
+    except Exception as e:
+        print(f"  ! Warning: Failed to clean up local release target {target}: {e}")

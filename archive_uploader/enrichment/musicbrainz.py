@@ -2,88 +2,95 @@
 
 import urllib.parse
 import musicbrainzngs
+from typing import Optional, Dict, Any
 
 from archive_uploader import __version__
-from archive_uploader.enrichment.base import BaseEnricher
+from archive_uploader.enrichment.base import Provider, BaseEnricher
 from archive_uploader.models import ExternalLink, Release
 
 
-class MusicBrainzEnricher(BaseEnricher):
+class MusicBrainzProvider(Provider):
     """Enriches release metadata using MusicBrainz API and extracts external relations."""
+
+    name = "musicbrainz"
+    logo_url = "https://www.google.com/s2/favicons?domain=musicbrainz.org&sz=32"
 
     def __init__(self) -> None:
         musicbrainzngs.set_useragent("archive-flac-uploader", __version__, "user@archive.org")
 
-    def enrich(self, release: Release) -> Release:
+    def fetch(self, rel: Release) -> Optional[Dict[str, Any]]:
+        """Fetch metadata dict from MusicBrainz for the pipeline."""
+        mb_id = rel.provider_ids.get("musicbrainz")
+
         try:
-            mb_id = None
-            if release.upc:
-                res = musicbrainzngs.search_releases(barcode=release.upc)
+            if not mb_id and rel.upc:
+                res = musicbrainzngs.search_releases(barcode=rel.upc)
                 if res.get("release-list"):
                     mb_id = res["release-list"][0]["id"]
 
-            if not mb_id and release.artist and release.title:
-                query = f'artist:"{release.artist}" AND release:"{release.title}"'
+            if not mb_id and rel.artist and rel.title:
+                query = f'artist:"{rel.artist}" AND release:"{rel.title}"'
                 res = musicbrainzngs.search_releases(query=query, limit=1)
                 if res.get("release-list"):
                     mb_id = res["release-list"][0]["id"]
 
-            if mb_id:
-                release.provider_ids["musicbrainz"] = mb_id
-                mb_url = f"https://musicbrainz.org/release/{mb_id}"
-                
-                # Add MusicBrainz link badge
-                if not any(link.url == mb_url for link in release.external_links):
-                    logo = "https://www.google.com/s2/favicons?domain=musicbrainz.org&sz=32"
-                    release.external_links.append(
-                        ExternalLink(service="MusicBrainz", url=mb_url, logo_url=logo)
-                    )
+            if not mb_id:
+                return None
 
-                try:
-                    full_mb = musicbrainzngs.get_release_by_id(mb_id, includes=["url-rels"])
-                    mb_release = full_mb.get("release", {})
+            mb_url = f"https://musicbrainz.org/release/{mb_id}"
+            data: Dict[str, Any] = {
+                "id": mb_id,
+                "url": mb_url,
+            }
 
-                    relations = mb_release.get(
-                        "url-relation-list",
-                        mb_release.get("relation-list", mb_release.get("relations", [])),
-                    )
-                    for url_rel in relations:
-                        target_url = ""
-                        if isinstance(url_rel, dict):
-                            target_url = url_rel.get("target", "")
-                            if not target_url and isinstance(url_rel.get("url"), dict):
-                                target_url = url_rel.get("url", {}).get("resource", "")
+            full_mb = musicbrainzngs.get_release_by_id(
+                mb_id, includes=["url-rels", "artist-credits", "labels", "recordings"]
+            )
+            mb_release = full_mb.get("release", {})
 
-                        if not target_url:
-                            continue
+            if mb_release.get("title"):
+                data["title"] = mb_release["title"]
+            if mb_release.get("date"):
+                data["date"] = mb_release["date"]
+            if mb_release.get("barcode"):
+                data["upc"] = mb_release["barcode"]
 
-                        domain = urllib.parse.urlparse(target_url).netloc.replace("www.", "")
-                        logo = f"https://www.google.com/s2/favicons?domain={domain}&sz=32"
+            if mb_release.get("label-info-list"):
+                labels = [
+                    l["label"]["name"]
+                    for l in mb_release["label-info-list"]
+                    if "label" in l and "name" in l["label"]
+                ]
+                if labels:
+                    data["label"] = labels[0]
 
-                        if "spotify.com/album/" in target_url:
-                            service = "Spotify"
-                            spot_id = target_url.split("/album/")[-1].split("?")[0]
-                            release.provider_ids["spotify"] = spot_id
-                        elif "discogs.com/release/" in target_url:
-                            service = "Discogs"
-                            disc_id = target_url.split("/release/")[-1].split("-")[0]
-                            release.provider_ids["discogs"] = disc_id
-                        elif "apple.com" in target_url and "/id" in target_url:
-                            service = "Apple Music"
-                            app_id = target_url.split("/id")[-1].split("?")[0]
-                            release.provider_ids["apple_music"] = app_id
-                        else:
-                            service = domain.capitalize()
-
-                        if not any(link.url == target_url for link in release.external_links):
-                            release.external_links.append(
-                                ExternalLink(service=service, url=target_url, logo_url=logo)
-                            )
-
-                except Exception as e:
-                    print(f"  ! Warning: Failed to fetch MB url-rels: {e}")
-
+            return data
         except Exception as e:
-            print(f"  ! MusicBrainz search failed: {e}")
+            print(f"  ! MusicBrainz fetch failed: {e}")
+            return None
+
+    def enrich(self, release: Release) -> Release:
+        """Directly enrich a Release object (direct enrichment execution)."""
+        fetched = self.fetch(release)
+        if not fetched:
+            return release
+
+        mb_id = fetched.get("id")
+        mb_url = fetched.get("url")
+
+        if mb_id:
+            release.provider_ids["musicbrainz"] = mb_id
+        if mb_url and not any(link.url == mb_url for link in release.external_links):
+            release.external_links.append(
+                ExternalLink(service="MusicBrainz", url=mb_url, logo_url=self.logo_url)
+            )
+
+        for key in ("title", "date", "upc", "label"):
+            if fetched.get(key) and not getattr(release, key, None):
+                setattr(release, key, fetched[key])
 
         return release
+
+
+# Class name alias for backward compatibility
+MusicBrainzEnricher = MusicBrainzProvider

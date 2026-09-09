@@ -9,7 +9,11 @@ from typing import Dict, List, Set, Tuple
 from archive_uploader import __version__
 from archive_uploader.ia.identifiers import resolve_identifier
 from archive_uploader.models import ExternalLink, Release
-from archive_uploader.packaging import create_clean_zip, derive_opus_file
+from archive_uploader.packaging import (
+    create_clean_zip,
+    derive_opus_file,
+    determine_file_key,
+)
 from archive_uploader.state.backup import ensure_script_backup
 from archive_uploader.textutils import slugify
 
@@ -70,25 +74,6 @@ def is_valid_payload_file(p: Path) -> bool:
     if p.name.lower() in SYSTEM_EXCLUDES:
         return False
     return True
-
-
-def determine_file_key(file_path: Path, rel: Release) -> str:
-    """
-    Determines relative IA file key, preserving folder structure for multi-file items
-    and multi-disc subdirectories.
-    """
-    if rel.kind != "album" or not rel.dir_or_file.is_dir():
-        return file_path.name
-
-    album_dir = rel.dir_or_file
-    try:
-        rel_parts = file_path.relative_to(album_dir).parts
-        if len(rel_parts) > 1:
-            return file_path.relative_to(album_dir).as_posix()
-    except ValueError:
-        pass
-
-    return file_path.name
 
 
 def build_ia_payload(
