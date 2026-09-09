@@ -129,7 +129,7 @@ def upload_release(
         or (qobuz_id and store.is_uploaded(qobuz_id, expected_files=expected_keys))
         or store.is_uploaded(identifier, expected_files=expected_keys)
     ):
-        print(f"  -> [SKIPPED] '{identifier}' fully complete in local SQLite DB.")
+        print(f"  -> ⏭️ [SKIPPED] '{identifier}' fully complete in local SQLite DB.")
         if delete_after and not dry_run:
             delete_local_release(rel)
         return
@@ -137,7 +137,7 @@ def upload_release(
     # 2. Remote IA Manifest Validation (Direct Identifier)
     is_complete, missing_keys = check_remote_manifest(identifier, expected_keys)
     if is_complete:
-        print(f"  -> [SKIPPED] '{identifier}' already fully uploaded on Internet Archive.")
+        print(f"  -> ⏭️ [SKIPPED] '{identifier}' already fully uploaded on Internet Archive.")
         if hasattr(store, "mark_uploaded"):
             store.mark_uploaded(
                 identifier=identifier,
@@ -155,7 +155,7 @@ def upload_release(
     if len(missing_keys) == len(expected_keys):
         existing_upc_id = check_upc_match(rel, expected_keys)
         if existing_upc_id:
-            print(f"  -> [SKIPPED] Matched via UPC to fully uploaded item '{existing_upc_id}'.")
+            print(f"  -> ⏭️ [SKIPPED] Matched via UPC to fully uploaded item '{existing_upc_id}'.")
             if hasattr(store, "mark_uploaded"):
                 store.mark_uploaded(
                     identifier=existing_upc_id,
@@ -176,6 +176,18 @@ def upload_release(
     if len(missing_keys) < len(expected_keys):
         files_dict = {k: v for k, v in files_dict.items() if k in missing_keys}
 
+    # Print Post-Packaging Metadata Summary
+    total_bytes = sum(
+        Path(p).stat().st_size for p in files_dict.values() if Path(p).exists()
+    )
+    total_mb = total_bytes / (1024 * 1024)
+
+    print(f"\n🚀 Ready to Upload: {rel.title}")
+    print(f"  • Identifier: {identifier}")
+    print(f"  • Collection: {collection}")
+    print(f"  • Files to Upload: {len(files_dict)}")
+    print(f"  • Total Payload Size: ~{total_mb:.2f} MB\n")
+
     try:
         if dry_run:
             print(f"  [DRY RUN] Prepared upload payload for '{identifier}' ({len(files_dict)} files to upload).")
@@ -194,7 +206,6 @@ def upload_release(
                 wiki_raw=getattr(rel, "wikipedia_article", getattr(rel, "wiki_raw_data", getattr(rel, "wiki_data", None))),
                 ia_payload=metadata,
             )
-
 
         responses = ia.upload(
             identifier,

@@ -7,7 +7,6 @@ from pathlib import Path
 from .enrichment import enrich
 from .ia import upload_release
 from .scanning import scan_directory
-from .state.backup import snapshot_logs
 from .state.store import SQLiteStateStore
 
 def main() -> None:
@@ -42,13 +41,8 @@ def main() -> None:
     except KeyboardInterrupt:
         print("\nProcess canceled by user. Local files preserved. Exiting...")
         sys.exit(0)
-    finally:
-        created = snapshot_logs()
-        if created:
-            print(f"Snapshotted {len(created)} state log(s).")
 
     print("\nBatch processing completed.")
-
 
 if __name__ == "__main__":
     main()
