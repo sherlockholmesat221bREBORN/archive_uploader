@@ -7,7 +7,8 @@ from pathlib import Path
 from .enrichment import enrich
 from .ia import upload_release
 from .scanning import scan_directory
-from .state.store import SQLiteStateStore
+from .state.backup import snapshot_logs
+from .state.combined import CombinedStateStore
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Resumable FLAC to Internet Archive automated uploader.")
@@ -22,8 +23,11 @@ def main() -> None:
     args = parser.parse_args()
     root_path = Path(args.root).resolve()
 
-    # Force exclusive SQLite persistence engine
-    state = SQLiteStateStore()
+    # SQLite (local UPC/qobuz_id index + raw-json cache) + the per-device
+    # log store (cross-device dedup — see state/combined.py, DECISIONS.md).
+    # Previously forced SQLite-only here, which meant the log store was
+    # built but never actually consulted or written to.
+    state = CombinedStateStore()
 
     print(f"Scanning target path: {root_path}")
     releases = scan_directory(root_path)
@@ -40,8 +44,10 @@ def main() -> None:
             upload_release(rel, args.collection, args.mediatype, args.dry_run, args.delete_after_upload, state)
     except KeyboardInterrupt:
         print("\nProcess canceled by user. Local files preserved. Exiting...")
+        snapshot_logs()
         sys.exit(0)
 
+    snapshot_logs()
     print("\nBatch processing completed.")
 
 if __name__ == "__main__":

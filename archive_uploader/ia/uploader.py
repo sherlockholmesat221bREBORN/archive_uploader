@@ -9,7 +9,7 @@ from archive_uploader.ia.identifiers import resolve_identifier
 from archive_uploader.ia.payload import build_ia_payload, is_valid_payload_file
 from archive_uploader.models import Release
 from archive_uploader.packaging import delete_local_release, determine_file_key
-from archive_uploader.state.store import StateStore, Store
+from archive_uploader.state.combined import CombinedStateStore
 from archive_uploader.textutils import slugify
 
 FATAL_UPLOAD_ERRORS = (
@@ -34,7 +34,7 @@ def get_expected_file_keys(rel: Release) -> Set[str]:
     for flac_p in flac_list:
         flac_key = determine_file_key(flac_p, rel)
         expected.add(flac_key)
-        
+
         # Explicitly require derived Opus audio key for EVERY FLAC
         opus_key = str(Path(flac_key).with_suffix(".opus"))
         expected.add(opus_key)
@@ -111,25 +111,25 @@ def upload_release(
     mediatype: str,
     dry_run: bool = False,
     delete_after: bool = False,
-    state: Optional[StateStore] = None,
+    state: Optional[CombinedStateStore] = None,
     opus_bitrate: str = "192k",
 ) -> None:
-    """Executes pre-checks against SQLite DB and live IA manifests before processing."""
-    store = state or Store()
+    """Executes pre-checks against local state (SQLite + cross-device log) and live IA manifests before processing."""
+    store = state or CombinedStateStore()
 
     base = f"{rel.artist} {rel.title}".strip() or rel.dir_or_file.name
     id_hash = hashlib.md5(base.encode("utf-8")).hexdigest()[:8]
     identifier = resolve_identifier(base, id_hash, store)
     expected_keys = get_expected_file_keys(rel)
-    qobuz_id = rel.provider_ids.get("qobuz", "")
+    qobuz_id = rel.provider_ids.get("Qobuz", "")
 
-    # 1. Local SQLite Manifest Validation
+    # 1. Local State Validation (SQLite + cross-device log union)
     if (
         (rel.upc and store.is_uploaded(rel.upc, expected_files=expected_keys))
         or (qobuz_id and store.is_uploaded(qobuz_id, expected_files=expected_keys))
         or store.is_uploaded(identifier, expected_files=expected_keys)
     ):
-        print(f"  -> ⏭️ [SKIPPED] '{identifier}' fully complete in local SQLite DB.")
+        print(f"  -> ⏭️ [SKIPPED] '{identifier}' fully complete in local state.")
         if delete_after and not dry_run:
             delete_local_release(rel)
         return
@@ -201,9 +201,15 @@ def upload_release(
                 artist=rel.artist,
                 title=rel.title,
                 status="in_progress",
-                qobuz_raw=getattr(rel, "qobuz_raw_data", getattr(rel, "qobuz_data", getattr(rel, "qobuz_json", None))),
-                mb_raw=getattr(rel, "mb_raw_data", getattr(rel, "mb_data", getattr(rel, "musicbrainz_json", None))),
-                wiki_raw=getattr(rel, "wikipedia_article", getattr(rel, "wiki_raw_data", getattr(rel, "wiki_data", None))),
+                # Previously getattr(rel, "qobuz_raw_data", ...) / "mb_raw_data" —
+                # those attributes never existed on Release, so these were
+                # always None and qobuz_raw_json/mb_raw_json in SQLite were
+                # never actually populated. rel.raw_provider_data is the real
+                # thing now (see enrichment/pipeline.py), keyed by each
+                # provider's .name.
+                qobuz_raw=rel.raw_provider_data.get("Qobuz"),
+                mb_raw=rel.raw_provider_data.get("MusicBrainz"),
+                wiki_raw=rel.raw_provider_data.get("Wikipedia") or rel.wikipedia_article,
                 ia_payload=metadata,
             )
 

@@ -11,13 +11,15 @@ from archive_uploader import __version__
 from archive_uploader.ia.identifiers import resolve_identifier
 from archive_uploader.models import ExternalLink, Release
 from archive_uploader.packaging import create_clean_zip, derive_opus_file, determine_file_key
-from archive_uploader.state.backup import ensure_script_backup
+from archive_uploader.state.backup import compute_script_hash, get_repo_ref
 from archive_uploader.textutils import slugify
 
 SYSTEM_EXCLUDES = {
     ".ds_store", "thumbs.db", "desktop.ini", "@eadir",
     ".git", ".gitignore", "__pycache__",
 }
+
+REPO_URL = "https://github.com/sherlockholmesat221b/archive_uploader"
 
 DOMAIN_SERVICE_MAP = {
     "open.qobuz.com": "Qobuz",
@@ -73,7 +75,14 @@ def build_ia_payload(
     id_hash = hashlib.md5(base.encode("utf-8")).hexdigest()[:8]
     identifier = resolve_identifier(base, id_hash, known_identifiers)
 
-    backup_path, script_hash = ensure_script_backup()
+    # Previously: ensure_script_backup() tarred the whole package and
+    # attached it as a file to every single item. Now just hash + link
+    # to the exact commit on GitHub instead — same reproducibility
+    # guarantee (you can always see exactly what code produced this
+    # upload), without a multi-MB tarball duplicated on every item.
+    script_hash = compute_script_hash()
+    repo_ref = get_repo_ref()
+    repo_link = f"{REPO_URL}/tree/{repo_ref}"
 
     temp_cleanup_files: List[Path] = []
     opus_map: Dict[Path, Path] = {}
@@ -188,9 +197,10 @@ def build_ia_payload(
         badges = [render_link_badge(link) for link in rel.external_links]
         desc.append("<br><b>External Links:</b><br>" + " | ".join(badges))
 
-    if backup_path.exists():
-        backup_key = f"uploader_script_v{__version__}_{script_hash[:8]}{backup_path.suffix}"
-        files_dict[backup_key] = str(backup_path)
+    desc.append(
+        f'<br><br><i>Uploaded by <a href="{repo_link}" target="_blank" rel="nofollow">'
+        f'archive_uploader v{__version__}</a> ({script_hash[:8]})</i><br>'
+    )
 
     for flac_p in flac_list:
         key = determine_file_key(flac_p, rel)
@@ -238,6 +248,7 @@ def build_ia_payload(
         "subject": subject_tags,
         "uploader_version": f"archive_uploader v{__version__}",
         "uploader_script_sha256": script_hash,
+        "uploader_repo": repo_link,
     }
 
     if rel.upc:

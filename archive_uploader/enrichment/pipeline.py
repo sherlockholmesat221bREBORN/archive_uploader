@@ -7,15 +7,25 @@ from typing import List, Optional
 from ..config import CACHE_DIR
 from ..models import ExternalLink, Release
 from .base import Provider
+from .deezer import DeezerProvider
+from .discogs import DiscogsProvider
+from .lastfm import LastFmProvider
 from .musicbrainz import MusicBrainzProvider
 from .overrides import apply_overrides, load_overrides
 from .qobuz import QobuzProvider
 from .wikipedia import WikipediaProvider
 
-DEFAULT_PROVIDERS: List[Provider] = [QobuzProvider(), MusicBrainzProvider(), WikipediaProvider()]
+DEFAULT_PROVIDERS: List[Provider] = [
+    QobuzProvider(),
+    MusicBrainzProvider(),
+    WikipediaProvider(),
+    DiscogsProvider(),
+    LastFmProvider(),
+    DeezerProvider(),
+]
 
-# Fields a provider result dict may set directly on Release (besides id/url,
-# which are handled specially — see enrich()).
+# Fields a provider result dict may set directly on Release (besides id/url/
+# links, which are handled specially — see enrich()).
 _MERGE_FIELDS = (
     "genre", "label", "upc", "external_description", "copyright",
     "audio_spec", "cover_url", "wikipedia_article",
@@ -50,6 +60,8 @@ def enrich(rel: Release, providers: Optional[List[Provider]] = None) -> Release:
     providers = providers if providers is not None else DEFAULT_PROVIDERS
     print(f"\n[Enriching] {rel.artist} - {rel.title} ({rel.kind.upper()})")
 
+    existing_urls = {l.url for l in rel.external_links}
+
     for provider in providers:
         try:
             result = provider.fetch(rel)
@@ -61,12 +73,31 @@ def enrich(rel: Release, providers: Optional[List[Provider]] = None) -> Release:
             continue
 
         _cache_raw(rel, provider.name, result)
+        # Full raw dict, in-memory, keyed the same as provider_ids — this is
+        # what state/store.py's qobuz_raw_json/mb_raw_json columns read at
+        # DB-write time (see ia/uploader.py).
+        rel.raw_provider_data[provider.name] = result
 
         if result.get("id"):
             rel.provider_ids[provider.name] = result["id"]
-        if result.get("url"):
+
+        if result.get("url") and result["url"] not in existing_urls:
             rel.external_links.append(
                 ExternalLink(service=provider.name, url=result["url"], logo_url=provider.logo_url)
+            )
+            existing_urls.add(result["url"])
+
+        for link in result.get("links", []):
+            url = link.get("url")
+            if not url or url in existing_urls:
+                continue
+            existing_urls.add(url)
+            rel.external_links.append(
+                ExternalLink(
+                    service=link.get("service", ""),
+                    url=url,
+                    logo_url=link.get("logo_url", ""),
+                )
             )
 
         for field in _MERGE_FIELDS:

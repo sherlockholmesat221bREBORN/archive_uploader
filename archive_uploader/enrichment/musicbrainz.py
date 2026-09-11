@@ -12,7 +12,12 @@ from archive_uploader.models import ExternalLink, Release
 class MusicBrainzProvider(Provider):
     """Enriches release metadata using MusicBrainz API and extracts external relations."""
 
-    name = "musicbrainz"
+    # Was lowercase "musicbrainz" — matched rel.provider_ids's internal key
+    # fine, but also leaked into ExternalLink(service=provider.name, ...)
+    # in pipeline.py, so the badge rendered as lowercase "musicbrainz"
+    # instead of "MusicBrainz". Capitalized here; provider_ids lookup below
+    # updated to match.
+    name = "MusicBrainz"
     logo_url = "https://www.google.com/s2/favicons?domain=musicbrainz.org&sz=32"
 
     def __init__(self) -> None:
@@ -20,7 +25,7 @@ class MusicBrainzProvider(Provider):
 
     def fetch(self, rel: Release) -> Optional[Dict[str, Any]]:
         """Fetch metadata dict from MusicBrainz for the pipeline."""
-        mb_id = rel.provider_ids.get("musicbrainz")
+        mb_id = rel.provider_ids.get(self.name)
 
         try:
             if not mb_id and rel.upc:
@@ -64,13 +69,36 @@ class MusicBrainzProvider(Provider):
                 if labels:
                     data["label"] = labels[0]
 
+            # Previously fetched (via the "url-rels" include above) but
+            # never read — this is the actual source of the missing
+            # Discogs/Bandcamp/YouTube/etc links: MusicBrainz attaches
+            # these as relations on the release, and this was the only
+            # place that ever saw them.
+            url_rels = mb_release.get("url-relation-list", [])
+            if url_rels:
+                seen = {mb_url}
+                links = []
+                for relation in url_rels:
+                    target = relation.get("target")
+                    if target and target not in seen:
+                        seen.add(target)
+                        links.append({"url": target})
+                if links:
+                    data["links"] = links
+
             return data
         except Exception as e:
             print(f"  ! MusicBrainz fetch failed: {e}")
             return None
 
     def enrich(self, release: Release) -> Release:
-        """Directly enrich a Release object (direct enrichment execution)."""
+        """
+        Direct-enrichment path, kept for anyone importing MusicBrainzProvider
+        standalone. NOTE: enrichment/pipeline.py's DEFAULT_PROVIDERS flow
+        calls .fetch() + its own merge loop instead of this method — so
+        this is not what runs during a normal upload. Left in place only
+        for backward compatibility with any external callers.
+        """
         fetched = self.fetch(release)
         if not fetched:
             return release
@@ -79,11 +107,17 @@ class MusicBrainzProvider(Provider):
         mb_url = fetched.get("url")
 
         if mb_id:
-            release.provider_ids["musicbrainz"] = mb_id
+            release.provider_ids[self.name] = mb_id
         if mb_url and not any(link.url == mb_url for link in release.external_links):
             release.external_links.append(
-                ExternalLink(service="MusicBrainz", url=mb_url, logo_url=self.logo_url)
+                ExternalLink(service=self.name, url=mb_url, logo_url=self.logo_url)
             )
+        for link in fetched.get("links", []):
+            url = link.get("url")
+            if url and not any(l.url == url for l in release.external_links):
+                release.external_links.append(
+                    ExternalLink(service=link.get("service", ""), url=url, logo_url=link.get("logo_url", ""))
+                )
 
         for key in ("title", "date", "upc", "label"):
             if fetched.get(key) and not getattr(release, key, None):

@@ -3,7 +3,7 @@
 from typing import Any, Optional
 import internetarchive as ia
 
-from archive_uploader.state.store import Store
+from archive_uploader.state.combined import CombinedStateStore
 from archive_uploader.textutils import slugify
 
 
@@ -15,6 +15,10 @@ def resolve_identifier(
     """
     Resolves canonical IA item identifier. Checks known_identifiers set/store,
     local store, and remote IA status before falling back to truncated slug.
+
+    See DECISIONS.md: this legacy-vs-truncated fallback is deliberate, not
+    redundant — removing it re-uploads old items under a new identifier
+    instead of resuming them.
     """
     full_slug = slugify(base)
     legacy_identifier = f"flac-{full_slug}-{id_hash}"
@@ -38,9 +42,11 @@ def resolve_identifier(
     if legacy_identifier == new_identifier:
         return new_identifier
 
-    # Local state DB lookup
+    # Local state lookup (SQLite + cross-device log union). Previously a
+    # bare SQLite Store() here, which meant this fallback path couldn't
+    # see anything another device had uploaded.
     try:
-        store = Store()
+        store = CombinedStateStore()
         if store.is_uploaded(legacy_identifier):
             return legacy_identifier
     except Exception:

@@ -1,5 +1,5 @@
 """
-Central configuration: filesystem layout and device identity.
+Central configuration: filesystem layout, device identity, provider credentials.
 
 Everything else in the package imports paths from here rather than
 building its own — that's the seam that keeps "where does state live"
@@ -7,10 +7,12 @@ a one-line change instead of a grep-and-replace.
 """
 from __future__ import annotations
 
+import json
 import os
 import platform
 import uuid
 from pathlib import Path
+from typing import Any, Dict
 
 # --------------------------------------------------------------------------
 # Filesystem layout
@@ -49,6 +51,39 @@ def get_device_id() -> str:
     device_id = f"{host}-{uuid.uuid4().hex[:8]}"
     DEVICE_ID_FILE.write_text(device_id)
     return device_id
+
+# --------------------------------------------------------------------------
+# Provider credentials
+# --------------------------------------------------------------------------
+# Auth-requiring enrichment providers (Discogs, Last.fm, ...) read their
+# keys/tokens from here instead of hardcoding them. Two sources, checked
+# in order:
+#   1. SECRETS_FILE — a local, per-device, gitignored JSON file:
+#        {"discogs": {"token": "..."}, "lastfm": {"api_key": "..."}}
+#   2. Environment variables: ARCHIVE_UPLOADER_<PROVIDER>_<FIELD>
+#        e.g. ARCHIVE_UPLOADER_DISCOGS_TOKEN, ARCHIVE_UPLOADER_LASTFM_API_KEY
+# A provider with no credential configured just returns None from fetch()
+# like QobuzProvider already does when kabooz isn't set up — never raises.
+
+SECRETS_FILE = CONFIG_DIR / "secrets.json"
+
+
+def load_secrets() -> Dict[str, Any]:
+    if not SECRETS_FILE.exists():
+        return {}
+    try:
+        return json.loads(SECRETS_FILE.read_text())
+    except Exception:
+        return {}
+
+
+def get_secret(provider: str, field: str, default: str = "") -> str:
+    data = load_secrets()
+    val = data.get(provider, {}).get(field)
+    if val:
+        return str(val)
+    env_key = f"ARCHIVE_UPLOADER_{provider.upper()}_{field.upper()}"
+    return os.environ.get(env_key, default)
 
 # --------------------------------------------------------------------------
 # Misc shared constants

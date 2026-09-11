@@ -19,11 +19,19 @@ class Provider(ABC):
     @abstractmethod
     def fetch(self, rel: Release) -> Optional[dict]:
         """
-        Return a dict of fields to merge into the Release. Two keys are
+        Return a dict of fields to merge into the Release. Three keys are
         special and drive the generic badge/external-identifier
         rendering in ia/payload.py:
-          - "id":  this service's own id for the release
-          - "url": a link to the release's page on that service
+          - "id":    this service's own id for the release
+          - "url":   a link to the release's page on that service
+          - "links": optional list of extra links this provider turned up
+                      about the release (e.g. MusicBrainz's url-rels —
+                      Discogs, Bandcamp, YouTube, etc. relations attached
+                      to the MB entry). Each item is a dict:
+                      {"url": "...", "service": "" , "logo_url": ""}.
+                      "service"/"logo_url" may be left blank — payload.py
+                      infers a service name and favicon from the domain
+                      when they're empty.
         Any other recognized key (genre, label, upc, external_description,
         copyright, audio_spec, cover_url, wikipedia_article) is merged in
         directly. Return None on no match.
